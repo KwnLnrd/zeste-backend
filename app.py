@@ -35,7 +35,8 @@ CORS(app, origins=["*"], supports_credentials=True, methods=["GET", "POST", "PUT
 
 # --- CLERK AUTHENTICATION & WEBHOOK CONFIG ---
 CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
-CLERK_API_BASE_URL = "https://api.clerk.com/v1"
+# CORRECTIF : Utilisation de l'URL de l'API de développement de Clerk
+CLERK_API_BASE_URL = "https://api.clerk.dev/v1"
 CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET")
 
 if not CLERK_SECRET_KEY:
@@ -55,19 +56,13 @@ def requires_auth(f):
             token = auth_header.split(' ')[1]
             headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
             
-            # CORRECTIF: Utilisation de l'endpoint /tokens/introspect qui est le plus adapté.
-            # Il prend le token et retourne son état et ses claims.
             introspect_url = f"{CLERK_API_BASE_URL}/tokens/introspect"
             
-            # L'API Clerk attend des données au format form-urlencoded pour cet endpoint,
-            # nous utilisons donc le paramètre `data` de httpx.
             response = httpx.post(introspect_url, headers=headers, data={"token": token})
             
             if response.status_code == 200:
                 response_data = response.json()
-                # Nous vérifions si le token est actif avant de continuer.
                 if response_data.get("active"):
-                    # Les informations (claims) sont dans un objet nested.
                     request.claims = response_data.get("claims", {})
                 else:
                     raise Unauthorized("Inactive Token")
@@ -142,7 +137,6 @@ def slugify(text):
 
 def get_restaurant_from_claims():
     claims = getattr(request, 'claims', {})
-    # La réponse de l'introspection contient org_id et org_role
     org_id = claims.get('org_id')
     if not org_id:
         return None, ('Organization ID not found in token', 401)
@@ -153,7 +147,6 @@ def get_restaurant_from_claims():
 
 def is_admin():
     claims = getattr(request, 'claims', {})
-    # La réponse de l'introspection contient org_role
     role = claims.get('org_role')
     return role in ['org:admin', 'admin']
 
@@ -205,98 +198,4 @@ def clerk_webhook():
             restaurant = Restaurant.query.filter_by(clerk_org_id=data.get("id")).first()
             if restaurant:
                 restaurant.name = data.get("name")
-                restaurant.slug = data.get("slug") or slugify(data.get("name"))
-                db.session.commit()
-                app.logger.info(f"Restaurant for org {restaurant.clerk_org_id} updated.")
-
-        elif event_type == "organization.deleted":
-            restaurant = Restaurant.query.filter_by(clerk_org_id=data.get("id")).first()
-            if restaurant:
-                db.session.delete(restaurant)
-                db.session.commit()
-                app.logger.info(f"Restaurant for org {restaurant.clerk_org_id} deleted.")
-
-    except IntegrityError as e:
-        db.session.rollback()
-        app.logger.warning(f"Database integrity error for event {event_type}: {e}")
-    except Exception as e:
-        db.session.rollback()
-        app.logger.error(f"Error processing webhook event {event_type}: {e}")
-        return jsonify(status="error", message="Internal server error"), 500
-
-    return jsonify(status="success"), 200
-
-# --- STATIC FILE ROUTE ---
-@app.route('/uploads/<path:filename>')
-def uploaded_file(filename):
-    return send_from_directory(app.config['UPLOAD_FOLDER'], filename)
-
-# --- PROTECTED ROUTES ---
-@app.route('/api/v1/restaurant/settings', methods=['GET', 'PUT'])
-@requires_auth
-def restaurant_settings():
-    restaurant, error = get_restaurant_from_claims()
-    if error:
-        return jsonify({"error": error[0]}), error[1]
-
-    if not is_admin():
-        return jsonify({"error": "Forbidden: You must be an admin to perform this action."}), 403
-
-    if request.method == 'GET':
-        logo_url_full = f"/uploads/{restaurant.logo_url}" if restaurant.logo_url else None
-        return jsonify({
-            "name": restaurant.name,
-            "slug": restaurant.slug,
-            "logoUrl": logo_url_full,
-            "primaryColor": restaurant.primary_color,
-            "googleLink": restaurant.google_link,
-            "tripadvisorLink": restaurant.tripadvisor_link,
-        })
-
-    if request.method == 'PUT':
-        restaurant.name = request.form.get('name', restaurant.name)
-        restaurant.primary_color = request.form.get('primaryColor', restaurant.primary_color)
-        restaurant.google_link = request.form.get('googleLink', restaurant.google_link)
-        restaurant.tripadvisor_link = request.form.get('tripadvisorLink', restaurant.tripadvisor_link)
-
-        if 'logo' in request.files:
-            file = request.files['logo']
-            if file and file.filename != '' and allowed_file(file.filename):
-                filename = secure_filename(f"{restaurant.clerk_org_id}_{file.filename}")
-                file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
-                restaurant.logo_url = filename
-        
-        try:
-            db.session.commit()
-            logo_url_full = f"/uploads/{restaurant.logo_url}" if restaurant.logo_url else None
-            return jsonify({"message": "Settings updated successfully.", "logoUrl": logo_url_full}), 200
-        except Exception as e:
-            db.session.rollback()
-            app.logger.error(f"Error updating settings: {e}")
-            return jsonify({"error": "Failed to update settings"}), 500
-            
-    return jsonify({"error": "Method not allowed"}), 405
-
-@app.route('/api/v1/dashboard/stats', methods=['GET'])
-@requires_auth
-def get_dashboard_stats():
-    restaurant, error = get_restaurant_from_claims()
-    if error:
-        return jsonify({"error": error[0]}), error[1]
-
-    if is_admin():
-        # This is placeholder data. You'll need to implement real stats logic.
-        stats = {"totalReviews": 128, "averageRating": 4.8, "serverOfTheMonth": "Clara"}
-        return jsonify(stats)
-    else:
-        claims = getattr(request, 'claims', {})
-        user = User.query.filter_by(clerk_id=claims.get('sub')).first()
-        if not user:
-            return jsonify({"error": "User not found in local DB"}), 404
-        # This is placeholder data. You'll need to implement real stats logic.
-        stats = {"myReviews": 32, "myAverageRating": 4.9}
-        return jsonify(stats)
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+          
