@@ -30,21 +30,27 @@ def allowed_file(filename):
     return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
 # --- CORS ---
-# Pour le développement, autoriser toutes les origines est acceptable.
-# Pour la production, il faudra restreindre à l'URL de votre frontend.
 CORS(app, origins=["*"], supports_credentials=True, methods=["GET", "POST", "PUT", "DELETE", "OPTIONS"], allow_headers=["Authorization", "Content-Type"])
 
 # --- CONFIGURATION DE CLERK ---
-CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
-CLERK_API_BASE_URL = "https://api.clerk.dev/v1" # URL standard de l'API Clerk
+# Pour le test final, nous allons ignorer le .env et mettre la clé ici.
+# Suivez les instructions de l'Étape 8 du README.
+
+# 1. Commentez la ligne ci-dessous :
+#CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
+
+# 2. Décommentez la ligne ci-dessous et collez votre NOUVELLE clé secrète complète :
+CLERK_SECRET_KEY="sk_test_jDLpTCJQb3ckfJ3akbRNficMoGNSt4tSZ48GpP1A5q"
+
+CLERK_API_URL = os.environ.get("CLERK_API_URL", "https://api.clerk.com")
 CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET")
 
 if not CLERK_SECRET_KEY:
-    raise RuntimeError("CLERK_SECRET_KEY n'est pas définie dans les variables d'environnement.")
+    raise RuntimeError("CLERK_SECRET_KEY n'est pas définie. Suivez l'étape de débogage dans app.py.")
 if not CLERK_WEBHOOK_SECRET:
     raise RuntimeError("CLERK_WEBHOOK_SECRET n'est pas définie. Récupérez-la depuis votre dashboard Clerk.")
 
-# --- DÉCORATEUR D'AUTHENTIFICATION (AMÉLIORÉ) ---
+# --- DÉCORATEUR D'AUTHENTIFICATION ---
 def requires_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
@@ -57,10 +63,11 @@ def requires_auth(f):
         token = auth_header.split(' ')[1]
         app.logger.info(f"[AUTH] Token trouvé. Appel de l'API Clerk pour vérification.")
         app.logger.info(f"[AUTH] Utilisation de la clé secrète commençant par: {CLERK_SECRET_KEY[:10]}")
+        app.logger.info(f"[AUTH] Utilisation de l'URL d'API: {CLERK_API_URL}")
 
         try:
             headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
-            introspect_url = f"{CLERK_API_BASE_URL}/tokens/introspect"
+            introspect_url = f"{CLERK_API_URL}/tokens/introspect"
             
             with httpx.Client() as client:
                 response = client.post(introspect_url, headers=headers, data={"token": token})
@@ -70,14 +77,12 @@ def requires_auth(f):
             if response.status_code == 200:
                 response_data = response.json()
                 if response_data.get("active"):
-                    # Stocker les informations de l'utilisateur dans la requête pour un accès facile
                     request.claims = response_data.get("claims", {})
                     app.logger.info("[AUTH] SUCCÈS: Token valide et actif.")
                 else:
                     app.logger.error("[AUTH] ÉCHEC: Token inactif.")
                     raise Unauthorized("Token inactif")
             else:
-                # Cette erreur 404 est souvent due à une mauvaise clé secrète
                 app.logger.error(f"[AUTH] ÉCHEC: La vérification du token a échoué. Réponse de Clerk: {response.text}")
                 raise Unauthorized("Token invalide")
         except Exception as e:
@@ -92,7 +97,6 @@ database_url = os.getenv('DATABASE_URL')
 if not database_url:
     raise RuntimeError("DATABASE_URL n'est pas définie dans le fichier .env.")
 
-# SQLAlchemy requiert 'postgresql' au lieu de 'postgres'
 if database_url.startswith("postgres://"):
     database_url = database_url.replace("postgres://", "postgresql://", 1)
 
@@ -100,7 +104,7 @@ app.config['SQLALCHEMY_DATABASE_URI'] = database_url
 app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 db = SQLAlchemy(app)
 
-# --- MODÈLES DE BASE DE DONNÉES (UNIFIÉS) ---
+# --- MODÈLES DE BASE DE DONNÉES ---
 class User(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     clerk_id = db.Column(db.String(120), unique=True, nullable=False, index=True)
@@ -118,9 +122,18 @@ class Restaurant(db.Model):
     google_link = db.Column(db.Text, nullable=True)
     tripadvisor_link = db.Column(db.Text, nullable=True)
 
-# Création des tables si elles n'existent pas
 with app.app_context():
     db.create_all()
+
+# --- ROUTE DE DÉBOGAGE ---
+@app.route("/api/v1/debug/env")
+def debug_env():
+    key_start = CLERK_SECRET_KEY[:10] if CLERK_SECRET_KEY else "Non définie"
+    return jsonify({
+        "message": "Variables d'environnement pour le débogage de Clerk",
+        "CLERK_API_URL": CLERK_API_URL,
+        "CLERK_SECRET_KEY_PREFIX": f"{key_start}..."
+    })
 
 # --- FONCTIONS UTILITAIRES ---
 def slugify(text):
@@ -139,7 +152,6 @@ def get_restaurant_from_claims():
 
 def is_admin():
     claims = getattr(request, 'claims', {})
-    # Le rôle standard d'administrateur dans Clerk est 'org:admin'
     return claims.get('org_role') == 'org:admin'
 
 # --- ROUTE WEBHOOK CLERK ---
@@ -181,8 +193,6 @@ def clerk_webhook():
             db.session.commit()
             app.logger.info(f"Restaurant {new_restaurant.name} créé pour l'org {new_restaurant.clerk_org_id}.")
 
-        # Ajoutez ici la logique pour user.updated, organization.updated, etc.
-
     except IntegrityError:
         db.session.rollback()
         app.logger.warning(f"Erreur d'intégrité pour l'événement {event_type}: l'entrée existe probablement déjà.")
@@ -210,7 +220,6 @@ def restaurant_settings():
         return jsonify({"error": "Action non autorisée. Rôle administrateur requis."}), 403
 
     if request.method == 'GET':
-        # Préfixe l'URL du logo avec /uploads/ pour que le frontend sache où le trouver
         logo_url_full = f"/uploads/{restaurant.logo_url}" if restaurant.logo_url else None
         return jsonify({
             "name": restaurant.name,
@@ -222,17 +231,14 @@ def restaurant_settings():
         })
 
     if request.method == 'PUT':
-        # Mise à jour des champs texte
         restaurant.name = request.form.get('name', restaurant.name)
         restaurant.primary_color = request.form.get('primaryColor', restaurant.primary_color)
         restaurant.google_link = request.form.get('googleLink', restaurant.google_link)
         restaurant.tripadvisor_link = request.form.get('tripadvisorLink', restaurant.tripadvisor_link)
 
-        # Gestion de l'upload du logo
         if 'logo' in request.files:
             file = request.files['logo']
             if file and file.filename != '' and allowed_file(file.filename):
-                # Crée un nom de fichier sécurisé et unique
                 filename = secure_filename(f"{restaurant.clerk_org_id}_{file.filename}")
                 file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
                 restaurant.logo_url = filename
@@ -250,5 +256,4 @@ def restaurant_settings():
 
 # --- POINT D'ENTRÉE POUR L'EXÉCUTION ---
 if __name__ == '__main__':
-    # Le port est géré par Flask/Gunicorn, 5000 par défaut pour le dev
     app.run(debug=True)
