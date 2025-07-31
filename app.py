@@ -54,11 +54,23 @@ def requires_auth(f):
         try:
             token = auth_header.split(' ')[1]
             headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
-            verify_url = f"{CLERK_API_BASE_URL}/sessions/verify"
-            response = httpx.post(verify_url, headers=headers, json={"token": token})
+            
+            # CORRECTIF: Utilisation de l'endpoint /tokens/introspect qui est le plus adapté.
+            # Il prend le token et retourne son état et ses claims.
+            introspect_url = f"{CLERK_API_BASE_URL}/tokens/introspect"
+            
+            # L'API Clerk attend des données au format form-urlencoded pour cet endpoint,
+            # nous utilisons donc le paramètre `data` de httpx.
+            response = httpx.post(introspect_url, headers=headers, data={"token": token})
             
             if response.status_code == 200:
-                request.claims = response.json()
+                response_data = response.json()
+                # Nous vérifions si le token est actif avant de continuer.
+                if response_data.get("active"):
+                    # Les informations (claims) sont dans un objet nested.
+                    request.claims = response_data.get("claims", {})
+                else:
+                    raise Unauthorized("Inactive Token")
             else:
                 app.logger.error(f"Clerk token verification failed: {response.status_code} {response.text}")
                 raise Unauthorized("Invalid Token")
@@ -130,7 +142,8 @@ def slugify(text):
 
 def get_restaurant_from_claims():
     claims = getattr(request, 'claims', {})
-    org_id = claims.get('active_org_id') or claims.get('org_id')
+    # La réponse de l'introspection contient org_id et org_role
+    org_id = claims.get('org_id')
     if not org_id:
         return None, ('Organization ID not found in token', 401)
     restaurant = Restaurant.query.filter_by(clerk_org_id=org_id).first()
@@ -140,7 +153,8 @@ def get_restaurant_from_claims():
 
 def is_admin():
     claims = getattr(request, 'claims', {})
-    role = claims.get('active_org_role') or claims.get('org_role')
+    # La réponse de l'introspection contient org_role
+    role = claims.get('org_role')
     return role in ['org:admin', 'admin']
 
 # --- CLERK WEBHOOK ---
@@ -286,4 +300,3 @@ def get_dashboard_stats():
 if __name__ == '__main__':
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port, debug=False)
-
