@@ -35,7 +35,13 @@ CORS(app, origins=["*"], supports_credentials=True, methods=["GET", "POST", "PUT
 
 # --- CLERK AUTHENTICATION & WEBHOOK CONFIG ---
 CLERK_SECRET_KEY = os.environ.get("CLERK_SECRET_KEY")
+
+
+# CORRECTIF FINAL : Nous hardcodons l'URL de l'API de développement US pour éliminer toute incertitude.
+# La variable d'environnement est ignorée pour ce test.
+# CLERK_API_BASE_URL = os.environ.get("CLERK_API_BASE_URL", "https://api.clerk.dev/v1")
 CLERK_API_BASE_URL = "https://api.clerk.dev/v1"
+
 CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET")
 
 if not CLERK_SECRET_KEY:
@@ -47,31 +53,55 @@ if not CLERK_WEBHOOK_SECRET:
 def requires_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
+        app.logger.info("--- [AUTH] Entering requires_auth decorator ---")
         auth_header = request.headers.get('Authorization')
         if not auth_header:
+            app.logger.error("[AUTH] FAILED: Missing Authorization Header")
             raise Unauthorized("Missing Authorization Header")
         
+        app.logger.info(f"[AUTH] Authorization header found.")
+
         try:
             token = auth_header.split(' ')[1]
-            headers = {"Authorization": f"Bearer {CLERK_SECRET_KEY}"}
+            headers = {
+                "Authorization": f"Bearer {CLERK_SECRET_KEY}",
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            data = {"token": token}
             introspect_url = f"{CLERK_API_BASE_URL}/tokens/introspect"
-            response = httpx.post(introspect_url, headers=headers, data={"token": token})
+            
+            app.logger.info(f"[AUTH] Calling Clerk API at: {introspect_url}")
+            app.logger.info(f"[AUTH] Using secret key starting with: {CLERK_SECRET_KEY[:10]}")
+
+            with httpx.Client() as client:
+                response = client.post(introspect_url, headers=headers, data=data)
+            
+            app.logger.info(f"[AUTH] Clerk API response status: {response.status_code}")
             
             if response.status_code == 200:
                 response_data = response.json()
+                app.logger.info(f"[AUTH] Clerk API response data: {response_data}")
                 if response_data.get("active"):
                     request.claims = response_data.get("claims", {})
+                    app.logger.info("[AUTH] SUCCESS: Token is active.")
                 else:
+                    app.logger.error("[AUTH] FAILED: Token is inactive.")
                     raise Unauthorized("Inactive Token")
             else:
-                app.logger.error(f"Clerk token verification failed: {response.status_code} {response.text}")
+                app.logger.error(f"[AUTH] FAILED: Clerk token verification failed. Response body: {response.text}")
                 raise Unauthorized("Invalid Token")
         except Exception as e:
-            app.logger.error(f"Token verification failed: {e}")
+            app.logger.error(f"[AUTH] FAILED: An exception occurred during token verification: {e}")
             raise Unauthorized("Invalid Token")
         
+        app.logger.info("--- [AUTH] Exiting requires_auth decorator ---")
         return f(*args, **kwargs)
     return decorated
+
+# --- HEALTH CHECK ENDPOINT ---
+@app.route("/api/v1/health")
+def health_check():
+    return jsonify({"status": "ok"}), 200
 
 # --- DATABASE CONFIGURATION ---
 database_url = os.getenv('DATABASE_URL')
@@ -161,7 +191,6 @@ def clerk_webhook():
 
     event_type = event.get("type")
     data = event.get("data")
-    
     app.logger.info(f"Received webhook event: {event_type}")
 
     try:
@@ -170,27 +199,15 @@ def clerk_webhook():
             if not email:
                 app.logger.warning("User created webhook without email address.")
                 return jsonify(status="success"), 200
-            
-            new_user = User(
-                clerk_id=data.get("id"),
-                email=email,
-                first_name=data.get("first_name"),
-                last_name=data.get("last_name"),
-            )
+            new_user = User(clerk_id=data.get("id"), email=email, first_name=data.get("first_name"), last_name=data.get("last_name"))
             db.session.add(new_user)
             db.session.commit()
             app.logger.info(f"User {new_user.clerk_id} created in local DB.")
-
         elif event_type == "organization.created":
-            new_restaurant = Restaurant(
-                clerk_org_id=data.get("id"),
-                name=data.get("name"),
-                slug=data.get("slug") or slugify(data.get("name"))
-            )
+            new_restaurant = Restaurant(clerk_org_id=data.get("id"), name=data.get("name"), slug=data.get("slug") or slugify(data.get("name")))
             db.session.add(new_restaurant)
             db.session.commit()
             app.logger.info(f"Restaurant {new_restaurant.name} created for org {new_restaurant.clerk_org_id}.")
-
         elif event_type == "organization.updated":
             restaurant = Restaurant.query.filter_by(clerk_org_id=data.get("id")).first()
             if restaurant:
@@ -198,15 +215,12 @@ def clerk_webhook():
                 restaurant.slug = data.get("slug") or slugify(data.get("name"))
                 db.session.commit()
                 app.logger.info(f"Restaurant for org {restaurant.clerk_org_id} updated.")
-
         elif event_type == "organization.deleted":
             restaurant = Restaurant.query.filter_by(clerk_org_id=data.get("id")).first()
             if restaurant:
                 db.session.delete(restaurant)
                 db.session.commit()
                 app.logger.info(f"Restaurant for org {restaurant.clerk_org_id} deleted.")
-
-    # CORRECTIF : Le bloc except manquant est restauré ici.
     except IntegrityError as e:
         db.session.rollback()
         app.logger.warning(f"Database integrity error for event {event_type}: {e}")
@@ -214,7 +228,6 @@ def clerk_webhook():
         db.session.rollback()
         app.logger.error(f"Error processing webhook event {event_type}: {e}")
         return jsonify(status="error", message="Internal server error"), 500
-
     return jsonify(status="success"), 200
 
 # --- STATIC FILE ROUTE ---
@@ -229,34 +242,22 @@ def restaurant_settings():
     restaurant, error = get_restaurant_from_claims()
     if error:
         return jsonify({"error": error[0]}), error[1]
-
     if not is_admin():
         return jsonify({"error": "Forbidden: You must be an admin to perform this action."}), 403
-
     if request.method == 'GET':
         logo_url_full = f"/uploads/{restaurant.logo_url}" if restaurant.logo_url else None
-        return jsonify({
-            "name": restaurant.name,
-            "slug": restaurant.slug,
-            "logoUrl": logo_url_full,
-            "primaryColor": restaurant.primary_color,
-            "googleLink": restaurant.google_link,
-            "tripadvisorLink": restaurant.tripadvisor_link,
-        })
-
+        return jsonify({"name": restaurant.name, "slug": restaurant.slug, "logoUrl": logo_url_full, "primaryColor": restaurant.primary_color, "googleLink": restaurant.google_link, "tripadvisorLink": restaurant.tripadvisor_link})
     if request.method == 'PUT':
         restaurant.name = request.form.get('name', restaurant.name)
         restaurant.primary_color = request.form.get('primaryColor', restaurant.primary_color)
         restaurant.google_link = request.form.get('googleLink', restaurant.google_link)
         restaurant.tripadvisor_link = request.form.get('tripadvisorLink', restaurant.tripadvisor_link)
-
         if 'logo' in request.files:
             file = request.files['logo']
             if file and file.filename != '' and allowed_file(file.filename):
                 filename = secure_filename(f"{restaurant.clerk_org_id}_{file.filename}")
                 file.save(os.path.join(app.config['UPLOAD_FOLDER'], filename))
                 restaurant.logo_url = filename
-        
         try:
             db.session.commit()
             logo_url_full = f"/uploads/{restaurant.logo_url}" if restaurant.logo_url else None
@@ -264,28 +265,4 @@ def restaurant_settings():
         except Exception as e:
             db.session.rollback()
             app.logger.error(f"Error updating settings: {e}")
-            return jsonify({"error": "Failed to update settings"}), 500
-            
-    return jsonify({"error": "Method not allowed"}), 405
-
-@app.route('/api/v1/dashboard/stats', methods=['GET'])
-@requires_auth
-def get_dashboard_stats():
-    restaurant, error = get_restaurant_from_claims()
-    if error:
-        return jsonify({"error": error[0]}), error[1]
-
-    if is_admin():
-        stats = {"totalReviews": 128, "averageRating": 4.8, "serverOfTheMonth": "Clara"}
-        return jsonify(stats)
-    else:
-        claims = getattr(request, 'claims', {})
-        user = User.query.filter_by(clerk_id=claims.get('sub')).first()
-        if not user:
-            return jsonify({"error": "User not found in local DB"}), 404
-        stats = {"myReviews": 32, "myAverageRating": 4.9}
-        return jsonify(stats)
-
-if __name__ == '__main__':
-    port = int(os.environ.get('PORT', 8000))
-    app.run(host='0.0.0.0', port=port, debug=False)
+            return jsonify({"error": "Failed to update settings"}),
