@@ -41,7 +41,7 @@ CLERK_WEBHOOK_SECRET = os.environ.get("CLERK_WEBHOOK_SECRET")
 if not CLERK_SECRET_KEY:
     raise RuntimeError("CLERK_SECRET_KEY is not set in environment variables.")
 if not CLERK_WEBHOOK_SECRET:
-    raise RuntimeError("CLERK_WEBHOOK_SECRET is not set in environment variables.")
+    raise RuntimeError("CLERK_WEBHOOK_SECRET is not set in environment variables. Get it from your Clerk dashboard.")
 
 # --- AUTHENTICATION DECORATOR ---
 def requires_auth(f):
@@ -208,7 +208,6 @@ def clerk_webhook():
     except Exception as e:
         db.session.rollback()
         app.logger.error(f"Error processing webhook event {event_type}: {e}")
-        # Return 500 to signal Clerk to retry the webhook
         return jsonify(status="error", message="Internal server error"), 500
 
     return jsonify(status="success"), 200
@@ -262,4 +261,29 @@ def restaurant_settings():
             app.logger.error(f"Error updating settings: {e}")
             return jsonify({"error": "Failed to update settings"}), 500
             
-    ret
+    return jsonify({"error": "Method not allowed"}), 405
+
+@app.route('/api/v1/dashboard/stats', methods=['GET'])
+@requires_auth
+def get_dashboard_stats():
+    restaurant, error = get_restaurant_from_claims()
+    if error:
+        return jsonify({"error": error[0]}), error[1]
+
+    if is_admin():
+        # This is placeholder data. You'll need to implement real stats logic.
+        stats = {"totalReviews": 128, "averageRating": 4.8, "serverOfTheMonth": "Clara"}
+        return jsonify(stats)
+    else:
+        claims = getattr(request, 'claims', {})
+        user = User.query.filter_by(clerk_id=claims.get('sub')).first()
+        if not user:
+            return jsonify({"error": "User not found in local DB"}), 404
+        # This is placeholder data. You'll need to implement real stats logic.
+        stats = {"myReviews": 32, "myAverageRating": 4.9}
+        return jsonify(stats)
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 8000))
+    app.run(host='0.0.0.0', port=port, debug=False)
+
